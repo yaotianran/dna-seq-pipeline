@@ -10,6 +10,7 @@ This pipeline written in python is much easier to run, configured and modified. 
 2. Dependency
 
 a, common utility, can be download at https://github.com/yaotianran/common/blob/master/common.py
+
 b, python packages: pandas, numpy
 
 (to be continued)
