@@ -1,11 +1,16 @@
 # dna-seq-pipeline
 Python-implemented GATK Best Practices SNPs/Indels calling pipeline
 
-update 20190403. add tumor mutation burden function. 
+Update 20190403. add tumor mutation burden function. 
+
 Reference: 
+
 [1] Pathogenic variant burden in the ExAC database: an empirical approach to evaluating population data for clinical variant interpretation (2017 Y. Kobayashi et al)
+
 [2] Analysis of 100,000 human cancer genomes reveals the landscape of tumor mutational burden (2017 Z. R. Chalmers et al)
+
 [3] Whole exome sequencing for determination of tumor mutation load in liquid biopsy from advanced cancer patients (2017 F. Koeppel et al)
+
 [4] Methods of measurement for tumor mutational burden in tumor tissue (2018 B. Meléndez et al)
 
 ==============
