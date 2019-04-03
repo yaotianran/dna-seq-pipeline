@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 0.2_rc (Build20190315)
+# 0.2rc3 (Build20190401)
 # Useage: python gene_panel.py gene_panel.ini
 # Required files:
     # One or more pairs of fastq files with suffices _1P and _2P, all belong to different read groups of one same sample
@@ -33,7 +33,7 @@ else:
 SAMPLE_LST = CASE_LST + CONTROL_LST
 SAMPLE_ANOUMT_INT = CASE_AMOUNT_INT + CONTROL_AMOUNT_INT
 COHORT_STR = CONFIG.get('PRIMARY', 'cohort_name')
-PON_STR = CONFIG.get('PRIMARY', 'pon')
+PON_STR = CONFIG.get('SOMATICS', 'pon')
 if PON_STR == '':
     PON_STR = COHORT_STR + '.vcf.gz'
 
@@ -41,25 +41,25 @@ TASK_LST = re.sub(r'\s+', '', CONFIG.get('PRIMARY', 'task')).split('|')
 
 REF_FASTA = CONFIG.get('RESOURCES', 'ref_fasta')
 CPU_INT = 0 # assign on the fly
-BWA = CONFIG.get('PATH', 'bwa')
-GATK = CONFIG.get('PATH', 'gatk')
-PICARD = CONFIG.get('PATH', 'picard')
-SAMTOOLS = CONFIG.get('PATH', 'samtools')
-VARSCAN = CONFIG.get('PATH', 'varscan')
-ANNOVAR = CONFIG.get('PATH', 'annovar')
+BWA = CONFIG.get('TOOLS', 'bwa')
+GATK = CONFIG.get('TOOLS', 'gatk')
+PICARD = CONFIG.get('TOOLS', 'picard')
+SAMTOOLS = CONFIG.get('TOOLS', 'samtools')
+VARSCAN = CONFIG.get('TOOLS', 'varscan')
+ANNOVAR = CONFIG.get('TOOLS', 'annovar')
 
+CALLING_INTERVALS = CONFIG.get('PRIMARY', 'calling_intervals_file')
+VERBOSE = CONFIG.getboolean('PRIMARY', 'verbose', fallback= True)
 DBSNP = CONFIG.get('RESOURCES', 'dbsnp')
 KNOWN_SITES = CONFIG.get('RESOURCES', 'known_indels_sites')
-CALLING_INTERVALS = CONFIG.get('INTERVALS', 'calling_intervals_file')
 
-VERBOSE = CONFIG.getboolean('ARGS', 'verbose', fallback= True)
 
 #===================================================================
 ########################################################################
 class ExternalToolsError(Exception):
     """raise when an enternal tool (such as GATK) has a non-zero returncode"""
     #----------------------------------------------------------------------
-    def __init__(self, command, message):
+    def __init__(self, command:str, message:str):
         """
         Constructor
 
@@ -73,12 +73,14 @@ class ExternalToolsError(Exception):
         highlighted_error_str = 'An error occured when run the following command in process {pid}:\n\t{command}\n\n'.format(pid= os.getpid(), command= command)
         self.message = message
         tool_match_object = re.search(r'gatk|picard|samtools|bwa|varscan|annovar', command)
+
         if tool_match_object is None:  # we can't find out which tool you are using
             highlighted_error_str += message + '\n'
             cprint(highlighted_error_str)
             return None
 
-        tool_str = tool_match_object.group(0)  # we know which tool you are using
+        # we know which tool you are using so we can highlight the error message
+        tool_str = tool_match_object.group(0)
         if tool_str == 'picard':
             for line_str in message.split('\n'):
                 if line_str.split()[0] == 'Exception' or line_str.split()[0] == 'ERROR' or 'not a valid command' in line_str:
@@ -117,7 +119,7 @@ class ExternalToolsError(Exception):
 
         return None
 
-def __get_free_mem():
+def __get_free_mem() -> int:
     '''
     Return machine free memory in {integer} MB
     '''
@@ -133,6 +135,8 @@ def __get_free_mem():
 def __get_allele(symbol1:str, symbol2: str) -> str:
     '''
     input the Symbol1 [ATCG]{1} and IUPAC notation [WSMKRY]{1}, output the exact base
+
+    e.g. __get_allele('A', 'W') will return 'T'
     '''
 
     if symbol2 in ['A', 'T', 'C', 'G']:
@@ -152,6 +156,83 @@ def __get_allele(symbol1:str, symbol2: str) -> str:
         return(IUPAC_notation_dict[symbol2][not IUPAC_notation_dict[symbol2].index(symbol1)])
     except:
         return ''
+
+def __varscan_to_variant(*filenames: str) -> pd.DataFrame:
+    '''input one or a few varscan output file(s), it will generate a pandas date frame
+
+    Columns: Chr, Start, End, Ref, Alt, VarFreq
+    '''
+
+    results_df = pd.DataFrame(data=None, columns=['Chr', 'Start', 'End', 'Ref', 'Alt', 'VarFreq'])
+    for s in filenames:
+        if not isinstance(s, str):
+            next
+
+        filename_str = path.realpath(path.expanduser(s))
+        if not readable(filename_str):
+            next
+
+        varscan_df = pd.read_csv(filename_str, sep= '\t')
+        if len(varscan_df) == 0:
+            next
+
+        if sum( varscan_df['Cons'].str.contains(r'\+|-') ) / len(varscan_df) >= 0.5:  #  this is a INDEL file
+            for indel_tu in varscan_df.itertuples():
+                try:
+                    if '+' in indel_tu.Cons:  # this is an insertion
+                        chr_str = indel_tu.Chrom
+                        start_int = int(indel_tu.Position) + 1
+                        end_int = int(indel_tu.Position) + 1
+                        ref_str = '-'
+                        alt_str = indel_tu.Cons.split('+')[1]
+                        ratio_str = indel_tu.VarFreq
+
+                    elif '-' in indel_tu.Cons:  # this is an deletion
+                        chr_str = indel_tu.Chrom
+                        start_int = int(indel_tu.Position) + 1
+                        ref_str = indel_tu.Cons.split('-')[1]
+                        alt_str = '-'
+                        end_int = start_int + len(ref_str) - 1
+                        ratio_str = indel_tu.VarFreq
+
+                    else:
+                        next
+
+                except Exception as ex:
+                    message = 'Fail to recogonize deletion/inserion in {}:\n{}'.format(s, indel_tu)
+                    print(ex)
+                    next
+
+                temp_df = pd.DataFrame({'Chr':chr_str, 'Start':start_int, 'End':end_int, 'Ref':ref_str, 'Alt':alt_str, 'VarFreq':ratio_str}, index=[0])
+                results_df = pd.concat([results_df, temp_df], ignore_index= True, sort= False)
+
+        else:    #  this is a SNP file
+            for snp_tu in varscan_df.itertuples():
+                try:
+                    chr_str = snp_tu.Chrom
+                    start_int = int(snp_tu.Position)
+                    end_int = int(snp_tu.Position)
+                    ref_str = snp_tu.Ref
+                    alt_str = __get_allele(ref_str, snp_tu.Cons)
+                    ratio_str = snp_tu.VarFreq
+                except Exception as ex:
+                    message = 'Fail to recogonize a SNV in {}:\n{}'.format(s, snp_tu)
+                    print(ex)
+                    next
+
+                temp_df = pd.DataFrame({'Chr':chr_str, 'Start':start_int, 'End':end_int, 'Ref':ref_str, 'Alt':alt_str, 'VarFreq':ratio_str}, index=[0])
+                results_df = pd.concat([results_df, temp_df], ignore_index= True, sort= False)
+
+
+    results_df.drop_duplicates(inplace= True)
+    results_df.sort_values(by=['Chr', 'Start', 'End'], inplace = True)
+    results_df.index = range(len(results_df))
+    try:
+        results_df['Start'] = pd.to_numeric(results_df['Start'])
+        results_df['End'] = pd.to_numeric(results_df['End'])
+    except Exception as ex:
+        print(ex)
+    return results_df
 
 
 def __calculate_contamination(tumor_name, normal_name= None):
@@ -177,7 +258,7 @@ def __calculate_contamination(tumor_name, normal_name= None):
     tumor_bam = '{tumor_name}.analysis_ready.bam'.format(tumor_name= tumor_name)
     normal_bam = '{normal_name}.analysis_ready.bam'.format(normal_name= normal_name)
 
-    interval = CONFIG.get('INTERVALS', 'calling_intervals_file')
+    interval = CONFIG.get('PRIMARY', 'calling_intervals_file')
     if interval != '' and readable(interval):
         interval_command = '--interval-set-rule INTERSECTION -L {}'.format(interval)
     else:
@@ -268,7 +349,7 @@ def __filter_by_orientation_bias(tumor_name, normal_name):
                                                                                              normal_name= normal_name)
 
     artifact_modes_command = ''
-    final_artifact_modes = CONFIG.get('ARGS', 'artifact_modes')
+    final_artifact_modes = CONFIG.get('SOMATICS', 'artifact_modes')
     if final_artifact_modes == '':
         final_artifact_modes = "'G/T'|'C/T'"
     final_artifact_modes = re.sub(r'\s+', '', final_artifact_modes)
@@ -338,7 +419,7 @@ def __filter_alignment_artifacts(tumor_name, normal_name, lock):
     lock.release()
 
     print('\n==================gatk FilterAlignmentArtifacts=========================')
-    realignment_extra_args = CONFIG.get('ARGS', 'realignment_extra_args')
+    realignment_extra_args = CONFIG.get('SOMATICS', 'realignment_extra_args')
     tumor_bam = '{tumor_name}.analysis_ready.bam'.format(tumor_name= tumor_name)
     command_str = '{GATK} --java-options "-Xmx{command_mem}m" FilterAlignmentArtifacts -R {REF_FASTA} -V {realignment_filter_input} -I {tumor_bam} --bwa-mem-index-image {realignment_index_bundle} {realignment_extra_args} -O {output_vcf}'.format(GATK= GATK,
                                                                                                                                                                                                                                                      command_mem= command_mem,
@@ -357,7 +438,7 @@ def __filter_alignment_artifacts(tumor_name, normal_name, lock):
 
     return
 
-def Check_ini():
+def Check_ini() -> None:
     '''
     Check all parameters readed from ini file, make sure they are all valid
     '''
@@ -384,8 +465,8 @@ def Check_ini():
         raise ValueError(message)
 
     for t in TASK_LST:
-        if t not in ['preprocessing', 'germline', 'somatic']:
-            message = '[PRIMARY] task must be the combination of either "preprocessing", "germline" or "somatic".\nCurrent value is {}'.format(TASK_LST)
+        if t not in ['preprocessing', 'germline', 'somatic', 'TMB']:
+            message = '[PRIMARY] task must be the combination of either "preprocessing", "TMB", "germline" or "somatic".\nCurrent value is {}'.format(TASK_LST)
             raise ValueError(message)
 
     if REF_FASTA == '' or not readable(REF_FASTA):
@@ -399,11 +480,12 @@ def Check_ini():
         raise TypeError(message)
 
     if CALLING_INTERVALS == '' or not readable(CALLING_INTERVALS):
-        message = '[INTERVALS] calling_intervals_file {} is empty or not readable. Exit'.format(CALLING_INTERVALS)
+        message = '[PRIMARY] calling_intervals_file {} is empty or not readable. Exit'.format(CALLING_INTERVALS)
         raise FileNotFoundError(message)
 
-    return
-def CreateSequenceGroupingTSV():
+    return None
+
+def CreateSequenceGroupingTSV() -> None:
 
     ref_prefix = path.splitext(REF_FASTA)[0]
     ref_dict = path.realpath(path.expanduser(ref_prefix + '.dict' ))
@@ -458,7 +540,7 @@ def CreateSequenceGroupingTSV():
         tsv_file_with_unmapped_f.write(tsv_str)
         tsv_file_with_unmapped_f.close()
 
-    return
+    return None
 
 def Preprocess(sample_name):
     '''
@@ -605,14 +687,14 @@ def Preprocess(sample_name):
         raise ExternalToolsError(command_str, r[1])
 
 
-    is_mark_duplicates = CONFIG.getboolean('TASK', 'mark_duplicates', fallback= False)
+    is_mark_duplicates = CONFIG.getboolean('PREPROCESS', 'mark_duplicates', fallback= False)
     if is_mark_duplicates:
         print('\n==================picard MarkDuplicates=========================')
 
-    barcode_tag = CONFIG.get('ARGS', 'barcode_tag')
-    read_one_barcode_tag = CONFIG.get('ARGS', 'read_one_barcode_tag')
-    read_two_barcode_tag = CONFIG.get('ARGS', 'read_two_barcode_tag')
-    remove_duplicates = CONFIG.getboolean('ARGS', 'remove_duplicates', fallback= True)
+    barcode_tag = CONFIG.get('PREPROCESS', 'barcode_tag')
+    read_one_barcode_tag = CONFIG.get('PREPROCESS', 'read_one_barcode_tag')
+    read_two_barcode_tag = CONFIG.get('PREPROCESS', 'read_two_barcode_tag')
+    remove_duplicates = CONFIG.getboolean('PREPROCESS', 'remove_duplicates', fallback= True)
 
     command_str = '{PICARD} MarkDuplicates TAG_DUPLICATE_SET_MEMBERS=true TAGGING_POLICY=All I=./{COHORT_STR}/{sample_name}.set_tags.bam O=./{COHORT_STR}/{sample_name}.removeDup.bam M=./{COHORT_STR}/{sample_name}.removeDup.txt'.format(COHORT_STR= COHORT_STR,
                                                                                                                                                                                                                                            PICARD= PICARD,
@@ -901,14 +983,19 @@ def CallGermlineVarscan(sample_name):
         if r[0] != 0 or not readable(output_file):
             raise ExternalToolsError(command_str, r[1])
 
-    truncate_depth_int = 99999999  # after test it is assumed that truncate_depth_int should be as large as possible, further test is still welcomed
-
-    command_str = '{SAMTOOLS} mpileup -A --min-BQ 1 --max-depth {truncate_depth_int} --positions ./{COHORT_STR}/{prefix}.bed --fasta-ref {REF_FASTA} {sample_name}.analysis_ready.bam > {COHORT_STR}/{sample_name}.mpileup'.format(SAMTOOLS= SAMTOOLS,
-                                                                                                                                                                                                                                   truncate_depth_int= truncate_depth_int,
-                                                                                                                                                                                                                                   COHORT_STR= COHORT_STR,
-                                                                                                                                                                                                                                   prefix= prefix,
-                                                                                                                                                                                                                                   REF_FASTA= REF_FASTA,
-                                                                                                                                                                                                                                   sample_name= sample_name)
+    truncate_depth_int = 1000000  # after test it is assumed that truncate_depth_int should be as large as possible, further test is still welcomed
+    min_BQ = CONFIG.getint('GERMLINE', 'min_BQ', fallback= 13)
+    min_MQ = CONFIG.getint('GERMLINE', 'min_MQ', fallback= 0)
+    mpileup_extra_args = CONFIG.get('GERMLINE', 'mpileup_extra_args', fallback= '')
+    command_str = '{SAMTOOLS} mpileup -A --min-BQ {min_BQ} --min-MQ {min_MQ} --max-depth {truncate_depth_int} --positions ./{COHORT_STR}/{prefix}.bed --fasta-ref {REF_FASTA} {mpileup_extra_args} {sample_name}.analysis_ready.bam > {COHORT_STR}/{sample_name}.mpileup'.format(SAMTOOLS= SAMTOOLS,
+                                                                                                                                                                                                                                                                                 min_BQ = min_BQ,
+                                                                                                                                                                                                                                                                                 min_MQ = min_MQ,
+                                                                                                                                                                                                                                                                                 truncate_depth_int= truncate_depth_int,
+                                                                                                                                                                                                                                                                                 COHORT_STR= COHORT_STR,
+                                                                                                                                                                                                                                                                                 prefix= prefix,
+                                                                                                                                                                                                                                                                                 REF_FASTA= REF_FASTA,
+                                                                                                                                                                                                                                                                                 mpileup_extra_args = mpileup_extra_args,
+                                                                                                                                                                                                                                                                                 sample_name= sample_name)
     print(command_str)
     print()
     r = common.run(command_str, VERBOSE)
@@ -922,11 +1009,11 @@ def CallGermlineVarscan(sample_name):
         sys.exit(1)
 
 
-    min_coverage = CONFIG.getint('ARGS', 'min_coverage', fallback= 8)
-    min_reads2 = CONFIG.getint('ARGS', 'min_read2', fallback= 2)
-    min_avg_qual = CONFIG.getint('ARGS', 'min_avg_qual', fallback= 15)
-    min_var_freq = CONFIG.getfloat('ARGS', 'min_var_freq', fallback= 0.01)
-    p_value = CONFIG.getfloat('ARGS', 'p_value', fallback= 0.99)
+    min_coverage = CONFIG.getint('GERMLINE', 'min_coverage', fallback= 8)
+    min_reads2 = CONFIG.getint('GERMLINE', 'min_read2', fallback= 2)
+    min_avg_qual = CONFIG.getint('GERMLINE', 'min_avg_qual', fallback= 15)
+    min_var_freq = CONFIG.getfloat('GERMLINE', 'min_var_freq', fallback= 0.01)
+    p_value = CONFIG.getfloat('GERMLINE', 'p_value', fallback= 0.99)
     command_str = '{VARSCAN} pileup2snp {COHORT_STR}/{sample_name}.mpileup --min-coverage {min_coverage} --min-reads2 {min_reads2} --min-avg-qual {min_avg_qual} --min-var-freq {min_var_freq} --p-value {p_value} | tee {COHORT_STR}/{sample_name}.varscan.snp'.format(VARSCAN= VARSCAN,
                                                                                                                                                                                                                                                                         COHORT_STR= COHORT_STR,
                                                                                                                                                                                                                                                                         sample_name= sample_name,
@@ -961,80 +1048,16 @@ def CallGermlineVarscan(sample_name):
     if 'Exception' in r[1]:
         raise ExternalToolsError(command_str, r[1])
 
+    varscan_snp_file = '{COHORT_STR}/{sample_name}.varscan.snp'.format(COHORT_STR= COHORT_STR,sample_name= sample_name)
+    varscan_indel_file = '{COHORT_STR}/{sample_name}.varscan.indel'.format(COHORT_STR= COHORT_STR,sample_name= sample_name)
 
     # Step 2, merge two results and re-format them into a standard SNPINDEL file ./{COHORT_STR}/{sample_name}.results.txt
-    # header-less:
-    # chr    start    end     ref    alt    (optional columns)
-    results_df = pd.DataFrame(data=None, columns=['chr', 'start', 'end', 'ref', 'alt', 'ratio'])
-
-    # re-format the SNP calling results into results_df
-    varscan_snp_file = '{COHORT_STR}/{sample_name}.varscan.snp'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    if readable(varscan_snp_file):
-        varscan_snp_df = pd.read_csv(varscan_snp_file, sep= '\t')
-    else:
-        message = '[Exception] Annotation error. Varscan SNPs file: {} not found.'.format(varscan_snp_file)
-        raise ExternalToolsError('[Annotate varscan results]', message)
-
-    if len(varscan_snp_df) > 0:
-        for snp_tu in varscan_snp_df.itertuples():
-            try:
-                chr_str = snp_tu.Chrom
-                start_int = int(snp_tu.Position)
-                end_int = int(snp_tu.Position)
-                ref_str = snp_tu.Ref
-                alt_str = __get_allele(ref_str, snp_tu.Cons)
-                ratio_str = snp_tu.VarFreq
-            except:
-                message = 'Fail to recogonize a SNV in {}:\n{}'.format(varscan_snp_file, snp_tu)
-                cprint(message)
-                next
-
-            temp_df = pd.DataFrame({'chr':chr_str, 'start':start_int, 'end':end_int, 'ref':ref_str, 'alt':alt_str, 'ratio':ratio_str}, index=[0])
-            results_df = pd.concat([results_df, temp_df], ignore_index= True, sort= False)
-
-    # re-format the INDEL calling results into results_df
-    varscan_indel_file = '{COHORT_STR}/{sample_name}.varscan.indel'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    if readable(varscan_indel_file):
-        varscan_indel_df = pd.read_csv(varscan_indel_file, sep= '\t')
-    else:
-        message = '[Exception] Annotation error. Varscan INDELs file: {} not found.'.format(varscan_indel_file)
-        raise ExternalToolsError('[Annotate varscan results]', message)
-
-    if len(varscan_indel_df) > 0:
-        for indel_tu in varscan_indel_df.itertuples():
-            temp_df = pd.DataFrame(data=None, columns=['chr', 'start', 'end', 'ref', 'alt', 'ratio'])
-
-            try:
-                if '+' in indel_tu.Cons:  # this is an insertion
-                    chr_str = indel_tu.Chrom
-                    start_int = int(indel_tu.Position) + 1
-                    end_int = int(indel_tu.Position) + 1
-                    ref_str = '-'
-                    alt_str = indel_tu.Cons.split('+')[1]
-                    ratio_str = indel_tu.VarFreq
-
-                elif '-' in indel_tu.Cons:  # this is an deletion
-                    chr_str = indel_tu.Chrom
-                    start_int = int(indel_tu.Position) + 1
-                    ref_str = indel_tu.Cons.split('-')[1]
-                    alt_str = '-'
-                    end_int = start_int + len(ref_str) - 1
-                    ratio_str = indel_tu.VarFreq
-
-                else:
-                    raise ValueError
-
-            except:
-                message = 'Fail to recogonize deletion/inserion in {}:\n{}'.format(varscan_indel_file, indel_tu)
-                cprint(message)
-                next
-
-            temp_df = pd.DataFrame({'chr':chr_str, 'start':start_int, 'end':end_int, 'ref':ref_str, 'alt':alt_str, 'ratio':ratio_str}, index=[0])
-            results_df = pd.concat([results_df, temp_df], ignore_index= True, sort= False)
+    # header:
+    # Chr    Start    End     Ref    Alt    VarFreq (optional columns)
+    results_df = __varscan_to_variant(varscan_snp_file, varscan_indel_file)
 
     # Finish concatenating the results
     if len(results_df) >= 0:
-        results_df.sort_values(by= ['chr', 'start', 'end'], inplace = True)
         output_file = './{COHORT_STR}/{sample_name}.results.txt'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
         print('{} SNPs/INDELs found.\nWrite to {}'.format(len(results_df), output_file))
         results_df.to_csv(output_file, sep= '\t', na_rep = 'NA', index= False)
@@ -1045,24 +1068,112 @@ def CallGermlineVarscan(sample_name):
     # merge the calling results and annotation info
     varscan_annotation_db = CONFIG.get('RESOURCES', 'varscan_annotation_db')
     if readable(varscan_annotation_db):
-        annotation_df = pd.read_csv(varscan_annotation_db, sep= '\t', header=None, names=['chr', 'start', 'end', 'ref', 'alt', 'gene', 'name'], dtype={'chr':str, 'start':int, 'end':int, 'ref':str, 'alt':str, 'gene':str, 'name':str})
+        #annotation_df = pd.read_csv(varscan_annotation_db, sep= '\t', header=None, names=['Chr', 'Start', 'End', 'Ref', 'Alt', 'Gene', 'Name'], dtype={'chr':str, 'start':int, 'end':int, 'ref':str, 'alt':str, 'gene':str, 'name':str})
+        annotation_df = pd.read_csv(varscan_annotation_db, sep= '\t')
+    else:
+        message = '{} is not readable. Annotation failed.'.format(varscan_annotation_db)
+        cprint(message)
+        sys.exit(1)
 
     try:
-        results_df['start'] = pd.to_numeric(results_df['start'])
-        results_df['end'] = pd.to_numeric(results_df['end'])
+        results_df['Start'] = pd.to_numeric(results_df['Start'])
+        results_df['End'] = pd.to_numeric(results_df['End'])
     except:
-        annotation_df['start'] = annotation_df['start'].astype('object')
-        annotation_df['end'] = annotation_df['end'].astype('object')
+        annotation_df['Start'] = annotation_df['Start'].astype('object')
+        annotation_df['End'] = annotation_df['End'].astype('object')
 
-    merged_df = pd.merge(results_df, annotation_df, how='inner', on = ['chr', 'start', 'end', 'ref', 'alt'])
-    merged_df = merged_df.iloc[:,[6,7,5]]
+    merged_df = pd.merge(annotation_df, results_df, how='inner', on = ['Chr', 'Start', 'End', 'Ref', 'Alt'])
+    merged_df = merged_df.iloc[:, range(5, len(merged_df.columns))]
     if len(merged_df) >= 2:
-        merged_df.sort_values(by= ['gene', 'ratio', 'name'], ascending= [True, False, True], inplace = True)
+        merged_df.sort_values(by= 'VarFreq', ascending= False, inplace = True)
     output_file = '{sample_name}.annotated.txt'.format(sample_name= sample_name)
     merged_df.to_csv(output_file, sep= '\t', na_rep = 'NA', index= False)
     print('{} SNPs/INDELs annotated. Write the results in {}'.format(len(merged_df), output_file))
 
     return 0
+
+def calc_TMB(sample_name:str) -> float:
+    '''
+    calculate the tumor mutation burden
+    '''
+    print('\n==================Calculate TMB=========================')
+    min_MQ = CONFIG.getint('TMB', 'min_MQ', fallback= 20)
+    mpileup_extra_args = CONFIG.get('TMB', 'mpileup_extra_args', fallback= '')
+    command_str = '{SAMTOOLS} mpileup --max-depth 1000000 --min-MQ {min_MQ} --fasta-ref {REF_FASTA} -l {CALLING_INTERVALS} -o {COHORT_STR}/{sample_name}.tmb.mpileup {sample_name}.analysis_ready.bam'.format(SAMTOOLS= SAMTOOLS,
+                                                                                                                                                                                                              sample_name= sample_name,
+                                                                                                                                                                                                              min_MQ = min_MQ,
+                                                                                                                                                                                                              REF_FASTA = REF_FASTA,
+                                                                                                                                                                                                              CALLING_INTERVALS = CALLING_INTERVALS,
+                                                                                                                                                                                                              COHORT_STR = COHORT_STR
+                                                                                                                                                                                                              )
+    print(command_str)
+    print()
+    r = common.run(command_str, VERBOSE)
+
+
+    min_var_freq = CONFIG.getfloat('TMB', 'min_var_freq', fallback= 0.01)
+    min_reads2 = CONFIG.getint('TMB', 'min_read2', fallback= 5)
+    min_coverage = CONFIG.getint('GERMLINE', 'min_coverage', fallback= 50)
+    command_str = '{VARSCAN} pileup2snp {COHORT_STR}/{sample_name}.tmb.mpileup --min-var-freq {min_var_freq} --min-reads2 {min_reads2} --min-coverage {min_coverage} > {COHORT_STR}/{sample_name}.tmb.snp'.format(VARSCAN = VARSCAN,
+                                                                                                                                                                                                              COHORT_STR = COHORT_STR,
+                                                                                                                                                                                                              sample_name = sample_name,
+                                                                                                                                                                                                              min_var_freq = min_var_freq,
+                                                                                                                                                                                                              min_reads2 = min_reads2,
+                                                                                                                                                                                                              min_coverage = min_coverage)
+    r = common.run(command_str, VERBOSE)
+    results_df = __varscan_to_variant('{COHORT_STR}/{sample_name}.tmb.snp'.format(COHORT_STR = COHORT_STR, sample_name = sample_name))
+    print('{sample_name} has {length} SNPs'.format(sample_name = sample_name, length = len(results_df)))
+
+    if len(results_df) == 0:
+        return -1
+
+    annotation_file_lst = re.sub(r'\s+', '', CONFIG.get('RESOURCES', 'tmb_discard_db')).split('|')
+    annotate_lst = [ pd.read_csv(file, sep='\t') for file in annotation_file_lst ]
+    for annotate_df in annotate_lst:  # discard the variants already in annotation database
+        temp_df = pd.merge(annotate_df, results_df, how='inner', on = ['Chr', 'Start', 'End', 'Ref', 'Alt'], left_index = True)
+        results_df = results_df.drop( index = temp_df.index )
+        print('Drop {length} SNPs'.format(length = len(temp_df)))
+
+    print('{sample_name} left {length} SNPs'.format(sample_name = sample_name, length = len(results_df)))
+    if len(results_df) == 0:
+        return -1
+
+    command_str = '{SAMTOOLS} depth -b {CALLING_INTERVALS} -d 9999999 -Q {min_MQ} {sample_name}.analysis_ready.bam > {COHORT_STR}/{sample_name}.tmb.depth'.format(SAMTOOLS = SAMTOOLS,
+                                                                                                                                                                  CALLING_INTERVALS = CALLING_INTERVALS,
+                                                                                                                                                                  min_MQ = min_MQ,
+                                                                                                                                                                  sample_name = sample_name,
+                                                                                                                                                                  COHORT_STR = COHORT_STR)
+    r = common.run(command_str)
+
+    depth_file = '{COHORT_STR}/{sample_name}.tmb.depth'.format(COHORT_STR  = COHORT_STR, sample_name = sample_name)
+    if not readable(depth_file):
+        cprint('{depth_file} not readable.'.format(depth_file = depth_file))
+        return -1
+
+    length_int = 0
+    with open(depth_file) as file_f:
+        for line_str in file_f.readlines():
+            try:
+                if int(line_str.strip().split()[2]) >= 50:
+                    length_int += 1
+                    if length_int % 100000 == 0:
+                        print(length_int, end= '\r')
+            except Exception as ex:
+                print(ex)
+                next
+        print(length_int)
+
+    try:
+        tmb_float = len(results_df) / length_int * 1000000
+        cprint("{sample_name}'s TMB equals to {count}/{length}*1000000 = {tmb_float}".format(sample_name = sample_name,
+                                                                                             length = length_int,
+                                                                                             count = len(results_df),
+                                                                                             tmb_float = round(tmb_float,2)))
+    except ZeroDivisionError:
+        cprint('{sample_name} sequencing deepth is too low. Skip'.format(sample_name = sample_name))
+        return -1
+
+    return tmb_float
 
 def CallGermlineHaplotypeCaller(sample_name):
     '''
@@ -1071,132 +1182,8 @@ def CallGermlineHaplotypeCaller(sample_name):
 
     return
 
-def AnnotateGermlineVariants_annovar(sample_name):
-    '''
-    Note: currently only SNPs will be annotated.
 
-    Use the vcf or any other result from variants caller to annotate the snps or indels.
-
-    Input file: two result files from caller:
-    1,{COHORT_STR}/{sample_name}.varscan.snp
-    2,{COHORT_STR}/{sample_name}.varscan.indel
-
-    The tab-delimited columns are
-    Chrom   Position   Ref   Cons   Reads1   Reads2   VarFreq   Strands1   Strands2   Qual1   Qual2   Pvalue   MapQual1   MapQual2   Reads1Plus   Reads1Minus   Reads2Plus   Reads2Minus   VarAllele
-
-    Output file: annotation results
-
-    {sample_name}.tsv
-
-    Chr	Position	Ref	Alt	Homo	CLNSIG	InterVar	Freq
-    '''
-
-    # prepare the input file for ANNOVAR
-    varscan_snp_file = '{COHORT_STR}/{sample_name}.varscan.snp'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    if readable(varscan_snp_file):
-        varscan_snp_df = pd.read_csv(varscan_snp_file, sep= '\t')
-    else:
-        message = '[Exception] Annotation error. Varscan SNPs file: {} not found.'.format(varscan_snp_file)
-        raise ExternalToolsError('[Annotate varscan results]', message)
-
-    # prepare the SNP input file
-    avinput_df = pd.DataFrame({'chr':varscan_snp_df.Chrom, 'start':varscan_snp_df.Position, 'end': varscan_snp_df.Position + len(varscan_snp_df.VarAllele) - 1, 'ref':varscan_snp_df.Ref, 'alt': varscan_snp_df.VarAllele, 'depth':varscan_snp_df.Reads1 + varscan_snp_df.Reads2, 'ratio': varscan_snp_df.VarFreq ,'homo': varscan_snp_df.Cons} )
-    avinput_df = avinput_df.loc[: ,['chr', 'start', 'end', 'ref', 'alt', 'homo', 'ratio', 'depth'] ]
-    avinput_df.homo = (avinput_df.alt == avinput_df.homo)
-
-    # prepare the Indel input file,
-    varscan_indel_file = '{COHORT_STR}/{sample_name}.varscan.indel'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    if readable(varscan_indel_file):
-        varscan_indel_df = pd.read_csv(varscan_indel_file, sep= '\t')
-    else:
-        message = '[Exception] Annotation error. Varscan INDELs file: {} not found.'.format(varscan_indel_file)
-        raise ExternalToolsError('[Annotate varscan results]', message)
-
-    # we have to do some format adjustment
-    for indel_tu in varscan_indel_df.itertuples():
-        temp_df = pd.DataFrame(data=[['']*8], columns=['chr', 'start', 'end', 'ref', 'alt', 'homo', 'ratio', 'depth'])
-        if indel_tu.VarAllele[0] == '+':  # this is an insertion
-            chr_str = indel_tu.Chrom
-            start_int = int(indel_tu.Position)
-            end_int = int(indel_tu.Position)
-            ref_str = '-'
-            alt_str = indel_tu.VarAllele[1:]
-            temp_lst = indel_tu.Cons.split('/')
-            homo_bool = (temp_lst[0] == temp_lst[1])
-            ratio_str = indel_tu.VarFreq
-            depth_int = int(indel_tu.Reads1) + int(indel_tu.Reads2)
-
-            temp_df.iloc[0] = [chr_str, start_int, end_int, ref_str, alt_str, homo_bool, ratio_str, depth_int]
-
-        elif indel_tu.VarAllele[0] == '-':  # this is an deletion
-            chr_str = indel_tu.Chrom
-            start_int = int(indel_tu.Position)
-            end_int = int(indel_tu.Position) + len(indel_tu.VarAllele) - 2
-            ref_str = indel_tu.VarAllele[1:]
-            alt_str = '-'
-            temp_lst = indel_tu.Cons.split('/')
-            homo_bool = (temp_lst[0] == temp_lst[1])
-            ratio_str = indel_tu.VarFreq
-            depth_int = int(indel_tu.Reads1) + int(indel_tu.Reads2)
-
-            temp_df.iloc[0] = [chr_str, start_int, end_int, ref_str, alt_str, homo_bool, ratio_str, depth_int]
-
-        else:
-            message = 'Fail to recogonize deletion/inserion for line:\n{}'.format(indel_tu)
-            raise ExternalToolsError('[Annotate varscan results]', message)
-
-        avinput_df = pd.concat([avinput_df, temp_df], axis= 0, ignore_index= True)
-
-    avinput_file = '{sample_name}.annovar.input'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    avinput_df.to_csv(avinput_file, sep= '\t', header= False, index= False )
-
-    # annotate the variants by ANNOVAR
-    # result : {COHORT_STR}/{sample_name}.hg38_multianno.txt
-    #protocol = 'cosmic86_coding,cosmic86_noncoding,clinvar_20180603,intervar_20180118,nci60,gnomad_exome,1000g2015aug_eas,1000g2015aug_all,avsnp150'
-    protocol = 'cosmic86_coding,cosmic86_noncoding,clinvar_20180603'
-    #operation = 'f,f,f,f,f,f,f,f,f'
-    operation = 'f,f,f'
-    command_str = 'perl {ANNOVAR} {avinput_file} ~/db/annovar_db/hg38/ --buildver hg38 --protocol {protocol} --operation {operation} --remove -out {COHORT_STR}/{sample_name}'.format(ANNOVAR= ANNOVAR,
-                                                                                                                                                                                      avinput_file= avinput_file,
-                                                                                                                                                                                      protocol= protocol,
-                                                                                                                                                                                      operation= operation,
-                                                                                                                                                                                      COHORT_STR= COHORT_STR,
-                                                                                                                                                                                      sample_name= sample_name)
-
-    print()
-    print(command_str)
-    r = common.run(command_str, VERBOSE)
-    if r[0] != 0:
-        raise ExternalToolsError(command_str, r[1])
-
-    print('\n\n----------------------------{}----------------------------'.format(avinput_file))
-    common.run('cat {}'.format(avinput_file))
-    print('-----------------------------------------------------' + '-'*len(avinput_file))
-
-    # format annotation results, make it look nicer and write to the result files
-    annovar_result_file = '{COHORT_STR}/{sample_name}.hg38_multianno.txt'.format(COHORT_STR= COHORT_STR, sample_name= sample_name)
-    if readable(annovar_result_file):
-        print('\n\n----------------------------{}----------------------------'.format(annovar_result_file))
-        common.run('cat {}'.format(annovar_result_file))
-        print('-----------------------------------------------------' + '-'*len(annovar_result_file))
-
-        '''
-        annovar_result_df = pd.read_csv(annovar_result_file, sep= '\t')
-        annovar_result_df = annovar_result_df.loc[:, ['Chr', 'Start', 'End', 'Ref', 'Alt', 'CLNSIG', 'InterVar_automated', 'gnomAD_exome_EAS', '1000g2015aug_eas'] ]
-        annovar_result_df = pd.concat([annovar_result_df.loc[:, ['Chr', 'Start', 'Ref', 'Alt', 'CLNSIG', 'InterVar_automated']], annovar_result_df.loc[:,['gnomAD_exome_EAS', '1000g2015aug_eas']].apply(np.mean, 1)], axis= 1)
-        annovar_result_df.columns= ['Chr', 'Position', 'Ref', 'Alt', 'CLNSIG', 'InterVar', 'Freq']
-
-        avinput_df = pd.read_csv(avinput_file, sep= '\t', names=['chr', 'start', 'end', 'ref', 'alt', 'Homo'])
-        annovar_result_df = pd.concat([annovar_result_df.loc[:,['Chr', 'Position', 'Ref', 'Alt']], avinput_df.loc[:,['Homo']], annovar_result_df.loc[:,['CLNSIG', 'InterVar', 'Freq']] ], axis=1)
-        annovar_result_df.to_csv('{sample_name}.tsv'.format(sample_name= sample_name), sep='\t', index= False)
-        print('\n{}:'.format(sample_name) )
-        print(annovar_result_df)
-        print('-----------------------------------------------------')
-        '''
-
-    return
-
-def SplitIntervals(N):
+def SplitIntervals(N: int) -> None:
     '''
     Split the [INTERVALS] calling_intervals_file into N partial interval files
     and put them into {COHORT_STR}/interval_files directory.
@@ -1218,7 +1205,7 @@ def SplitIntervals(N):
 
     print('\n==================gatk SplitIntervals=========================')
     command_mem = __get_free_mem() - 500
-    split_intervals_extra_args = CONFIG.get('ARGS', 'split_intervals_extra_args') # optional
+    split_intervals_extra_args = CONFIG.get('SOMATICS', 'split_intervals_extra_args') # optional
 
     if not path.isdir('{COHORT_STR}/interval_files'.format(COHORT_STR= COHORT_STR)):
         os.mkdir('{COHORT_STR}/interval_files'.format(COHORT_STR= COHORT_STR))
@@ -1236,7 +1223,7 @@ def SplitIntervals(N):
     r = common.run(command_str, VERBOSE)
     print('r[0] = ', r[0])
 
-    return
+    return None
 
 def CallSomaticMutect2(tumor_name, normal_name= None):
     '''
@@ -1283,7 +1270,7 @@ def CallSomaticMutect2(tumor_name, normal_name= None):
         p = Process(target= common.run, args=(command2_str, VERBOSE, proxy_dict, ))
         process_2_lst.append(p)
 
-    run_ob_mm_filter = CONFIG.getboolean('TASK', 'run_ob_mm_filter', fallback= True)
+    run_ob_mm_filter = CONFIG.getboolean('SOMATICS', 'run_ob_mm_filter', fallback= True)
     if run_ob_mm_filter:
 
         print('\n==================gatk CollectF1R2Counts=========================')
@@ -1322,14 +1309,14 @@ def CallSomaticMutect2(tumor_name, normal_name= None):
         print('Germline resource {} not found. Leave --germline-resource blank'.format(gnomad) )
         gnoman_command = ''
 
-    genotype_given_alleles = CONFIG.get('ARGS', 'genotype_given_alleles')
+    genotype_given_alleles = CONFIG.get('SOMATICS', 'genotype_given_alleles')
     if genotype_given_alleles != '' and readable(genotype_given_alleles):
         gga_command = '--genotyping-mode GENOTYPE_GIVEN_ALLELES --alleles {}'.format(genotype_given_alleles)
     else:
         print('Genotype alleles resource {} not found. Leave --alleles blank'.format(genotype_given_alleles) )
         gga_command = ''
 
-    m2_extra_args_command = CONFIG.get('ARGS', 'm2_extra_args')
+    m2_extra_args_command = CONFIG.get('SOMATICS', 'm2_extra_args')
 
     process_lst = []
     for interval in glob.glob('{COHORT_STR}/interval_files/*.intervals'.format(COHORT_STR= COHORT_STR) ):
@@ -1339,7 +1326,7 @@ def CallSomaticMutect2(tumor_name, normal_name= None):
                                                                                           normal_name= normal_name,
                                                                                           num_suffix= num_suffix)
 
-        make_bamout = CONFIG.getboolean('ARGS', 'make_bamout', fallback= False)
+        make_bamout = CONFIG.getboolean('SOMATICS', 'make_bamout', fallback= False)
         if make_bamout:
             bamout_command = '--bam-output {COHORT_STR}/{tumor_name}_{normal_name}_{num_suffix}.bamout.bam'.format(COHORT_STR= COHORT_STR,
                                                                                                                    tumor_name= tumor_name,
@@ -1513,8 +1500,8 @@ def CallSomaticMutect2(tumor_name, normal_name= None):
     input_vcf2 = '{COHORT_STR}/{tumor_name}_{normal_name}.somatic.filtered.vcf.gz'.format(COHORT_STR= COHORT_STR, tumor_name= tumor_name, normal_name= normal_name)   # FilterMutectCalls output
     output_vcf = '{tumor_name}_{normal_name}.final.vcf.gz'.format(tumor_name= tumor_name, normal_name= normal_name)
 
-    run_ob_filter = CONFIG.getboolean('TASK', 'run_ob_filter', fallback= False)
-    run_aa_filter = CONFIG.getboolean('TASK', 'run_aa_filter', fallback= True)
+    run_ob_filter = CONFIG.getboolean('SOMATICS', 'run_ob_filter', fallback= False)
+    run_aa_filter = CONFIG.getboolean('SOMATICS', 'run_aa_filter', fallback= True)
     if not run_ob_filter and not run_aa_filter:
         shutil.move(input_vcf2, output_vcf)
 
@@ -1567,7 +1554,7 @@ def CreatePoN(normal_name_list):
         input_vcf_command = input_vcf_command.strip()
 
     # set --duplicate_sample_strategy
-    duplicate_sample_strategy = CONFIG.get('ARGS', 'duplicate_sample_strategy')
+    duplicate_sample_strategy = CONFIG.get('SOMATICS', 'duplicate_sample_strategy')
     if duplicate_sample_strategy not in ['THROW_ERROR', 'CHOOSE_FIRST', 'ALLOW_ALL']:
         message = "duplicate_sample_strategy must be one of ['THROW_ERROR', 'CHOOSE_FIRST', 'ALLOW_ALL'], current value is {}. Change to 'CHOOSE_FIRST'.".format(duplicate_sample_strategy)
         print(message)
@@ -1605,7 +1592,7 @@ def main(argvList = sys.argv, argv_int = len(sys.argv)):
 
     #======================check==========================
     Check_ini()
-    #======================preprocess======================
+    #======================preprocess=====================
     process_lst = []
     if 'preprocessing' in TASK_LST:
 
@@ -1616,7 +1603,15 @@ def main(argvList = sys.argv, argv_int = len(sys.argv)):
 
         common.multi_run(process_lst, CPU_INT)
 
-    #======================germline mutation calling======================
+    #======================Call TMB======================
+    if 'TMB' in TASK_LST:
+        for sample_name in SAMPLE_LST:
+            p = Process(target=calc_TMB, args=(sample_name, ) )
+            process_lst.append(p)
+
+        common.multi_run(process_lst, CPU_INT)
+
+    #================germline mutation calling============
     process_lst = []
     if 'germline' in TASK_LST:
 
@@ -1637,7 +1632,7 @@ def main(argvList = sys.argv, argv_int = len(sys.argv)):
 
 
 
-    #======================Somatic calling======================
+    #===============Somatic calling================
     global SAMPLE_ANOUMT_INT
     scatter_amount = CPU_INT / SAMPLE_ANOUMT_INT
     scatter_amount = int(scatter_amount) if scatter_amount >=1 else 1
